@@ -1,0 +1,337 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Glass Cube — 玻璃方块</title>
+<style>
+  html, body { margin:0; height:100%; overflow:hidden; background:#f4f2ee; }
+  #gl { position:fixed; inset:0; width:100%; height:100%; display:block; cursor:grab; touch-action:none; }
+  #gl.dragging { cursor:grabbing; }
+  #hint {
+    position:fixed; right:18px; bottom:14px;
+    font:500 11px/1 "Helvetica Neue", Helvetica, Arial, sans-serif;
+    letter-spacing:.14em; text-transform:uppercase;
+    color:#141416; opacity:.4; user-select:none; pointer-events:none;
+    transition:opacity 1.4s ease;
+  }
+  #err { position:fixed; inset:0; display:none; place-items:center;
+         font:14px Helvetica, Arial, sans-serif; color:#333; background:#f4f2ee; }
+</style>
+</head>
+<body>
+<canvas id="gl"></canvas>
+<div id="hint">拖拽旋转 · 滚轮缩放</div>
+<div id="err">此效果需要浏览器支持 WebGL2。</div>
+<script>
+'use strict';
+
+// 从 faerghus-glass/index.html 提取的单个玻璃方块，无第三方依赖。
+// 可调参数：size 为半边长，spin 为自动旋转速度（弧度 / 秒）。
+const CUBE = { size: 0.36, spin: 0.22 };
+
+
+const canvas = document.getElementById('gl');
+const gl = canvas.getContext('webgl2', { antialias:false, alpha:false, powerPreference:'high-performance' });
+if (!gl) {
+  document.getElementById('err').style.display = 'grid';
+  throw new Error('WebGL2 not available');
+}
+
+/* ------------------------------ shaders ------------------------------ */
+
+const VERT = `#version 300 es
+void main(){
+  vec2 p = vec2(float((gl_VertexID<<1)&2), float(gl_VertexID&2));
+  gl_Position = vec4(p*2.0-1.0, 0.0, 1.0);
+}`;
+
+const FRAG = `#version 300 es
+precision highp float;
+out vec4 O;
+
+uniform vec2      uRes;
+uniform float     uTime;
+uniform sampler2D uText;
+uniform vec3      uC0; uniform float uS0; uniform mat3 uR0;
+
+const float TANY = 0.3153;   // tan(fov/2), fov ~ 35 deg
+const float CAMZ = 3.0;      // camera position on +z
+const float BGZ  = -0.9;     // z of the typography plane
+
+float hash21(vec2 p){
+  p = fract(p*vec2(234.34, 435.345));
+  p += dot(p, p+34.23);
+  return fract(p.x*p.y);
+}
+
+// slab test of ray vs axis-aligned cube (local space), returns (tNear, tFar)
+vec2 boxTS(vec3 ro, vec3 rd, float s){
+  vec3 inv = 1.0/rd;
+  vec3 t0 = (vec3(-s)-ro)*inv;
+  vec3 t1 = (vec3( s)-ro)*inv;
+  vec3 a = min(t0,t1), b = max(t0,t1);
+  return vec2(max(max(a.x,a.y),a.z), min(min(b.x,b.y),b.z));
+}
+
+vec3 boxN(vec3 p, float s){
+  vec3 a = abs(p);
+  if(a.x>a.y && a.x>a.z) return vec3(sign(p.x),0.0,0.0);
+  if(a.y>a.z)            return vec3(0.0,sign(p.y),0.0);
+  return vec3(0.0,0.0,sign(p.z));
+}
+
+// project a ray onto the typography plane and sample the poster texture
+vec3 bgAt(vec3 ro, vec3 rd){
+  float tz = (BGZ - ro.z)/(rd.z - 1e-5);
+  vec3 p = ro + rd*tz;
+  float d = max(CAMZ - p.z, 0.1);
+  vec2 sc = vec2(p.x/(d*TANY*(uRes.x/uRes.y)), p.y/(d*TANY));
+  return texture(uText, sc*0.5 + 0.5).rgb;
+}
+
+// trace + shade one glass cube; R transforms local -> world
+vec3 shadeCube(vec3 ro, vec3 rd, vec3 c, float s, mat3 R, out float tHit){
+  tHit = 1e9;
+  if(s < 0.01) return vec3(0.0);
+  mat3 Rt = transpose(R);
+  vec3 rol = Rt*(ro - c);
+  vec3 rdl = normalize(Rt*rd);
+  vec2 tt = boxTS(rol, rdl, s);
+  if(tt.y <= max(tt.x, 0.0)) return vec3(0.0);
+  float tn = max(tt.x, 0.0);
+  tHit = tn;
+  vec3 p1l = rol + rdl*tn;
+  vec3 n1 = R*boxN(p1l, s);
+
+  // chromatic dispersion: trace one ray per channel
+  vec3 acc = vec3(0.0);
+  vec3 ior3 = vec3(1.13, 1.16, 1.19);
+  for(int ch=0; ch<3; ch++){
+    float ior = ior3[ch];
+    vec3 d1 = refract(rd, n1, 1.0/ior);
+    if(dot(d1,d1) < 1e-8) d1 = reflect(rd, n1);
+    vec3 p = p1l;
+    vec3 d = Rt*d1;                 // march inside in local space
+    vec3 res = vec3(-1.0);
+    float w = 1.0;                  // deeper bounces ghost out gradually
+    for(int b=0; b<3; b++){         // up to 2 total internal reflections
+      p += d*1e-3;
+      vec2 t2 = boxTS(p, d, s);
+      if(t2.y <= max(t2.x, 0.0)) break;
+      vec3 p2 = p + d*t2.y;
+      vec3 n2l = boxN(p2, s);
+      vec3 dout = refract(d, -n2l, ior);
+      if(dot(dout,dout) > 1e-8){
+        res = bgAt(c + R*p2, R*dout);
+        break;
+      }
+      d = reflect(d, n2l);          // total internal reflection
+      p = p2;
+      w *= 0.58;
+    }
+    if(res.x < 0.0) res = bgAt(c + R*p1l, d1);
+    acc[ch] = res[ch]*w;
+  }
+  acc = mix(acc, vec3(1.0), 0.16);  // keep the glass clear, text ghostly
+
+  // fresnel + soft studio reflection
+  float cosT = clamp(dot(-rd, n1), 0.0, 1.0);
+  float F = 0.04 + 0.96*pow(1.0 - cosT, 5.0);
+  vec3 rr = reflect(rd, n1);
+  vec3 env = mix(vec3(1.0,1.0,1.0), vec3(0.94,0.96,1.0), clamp(0.5+0.5*rr.y, 0.0, 1.0));
+  vec3 col = mix(acc, env, clamp(F*0.85, 0.0, 1.0));
+
+  // face tone + edge definition so the cube reads as a solid glass block
+  vec3 nl = boxN(p1l, s);
+  float tone = 1.0 - 0.045*clamp(n1.y, 0.0, 1.0) - 0.025*abs(nl.x);
+  vec2 fuv = (abs(nl.x) > 0.5) ? p1l.yz : ((abs(nl.y) > 0.5) ? p1l.xz : p1l.xy);
+  float e = max(abs(fuv.x), abs(fuv.y))/s;
+  float band = smoothstep(0.80, 0.96, e)*(1.0 - smoothstep(0.965, 1.0, e));
+  float rim  = smoothstep(0.955, 0.995, e);
+  col = col*tone*(1.0 - 0.07*band) + vec3(0.09)*rim;
+
+  // iridescent sheen at grazing angles
+  float edge = pow(1.0 - cosT, 5.0);
+  vec3 irid = 0.5 + 0.5*cos(6.28318*(edge*1.2 + vec3(0.0,0.33,0.67)));
+  col += irid*edge*0.08;
+
+  // two specular highlights
+  vec3 L1 = normalize(vec3(-0.35, 0.80, 0.55));
+  vec3 L2 = normalize(vec3( 0.65,-0.35, 0.45));
+  col += pow(max(dot(n1, normalize(L1 - rd)), 0.0), 180.0)*0.9
+       + pow(max(dot(n1, normalize(L2 - rd)), 0.0),  48.0)*0.2;
+
+  return col*1.02 + 0.012;
+}
+
+void main(){
+  vec3 sum = vec3(0.0);
+  for(int i=0;i<2;i++){                       // 2-tap rotated-grid AA
+    vec2 off = (i==0) ? vec2(0.25,0.25) : vec2(-0.25,-0.25);
+    vec2 ndc = (gl_FragCoord.xy + off - 0.5*uRes)/uRes.y*2.0;
+    vec3 ro = vec3(0.0, 0.0, CAMZ);
+    vec3 rd = normalize(vec3(ndc.x*TANY, ndc.y*TANY, -1.0));
+    float tHit;
+    vec3 glass = shadeCube(ro, rd, uC0, uS0, uR0, tHit);
+    vec3 col = (tHit < 1e8) ? glass : bgAt(ro, rd);
+    sum += col;
+  }
+  vec3 col = sum*0.5;
+  col += (hash21(gl_FragCoord.xy + fract(uTime*13.0)*251.0) - 0.5)*0.016;  // film grain
+  O = vec4(clamp(col, 0.0, 1.0), 1.0);
+}`;
+
+function compile(type, src){
+  const s = gl.createShader(type);
+  gl.shaderSource(s, src); gl.compileShader(s);
+  if(!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s));
+  return s;
+}
+const prog = gl.createProgram();
+gl.attachShader(prog, compile(gl.VERTEX_SHADER, VERT));
+gl.attachShader(prog, compile(gl.FRAGMENT_SHADER, FRAG));
+gl.linkProgram(prog);
+if(!gl.getProgramParameter(prog, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(prog));
+gl.useProgram(prog);
+
+const U = {};
+['uRes','uTime','uText','uC0','uS0','uR0'].forEach(n => U[n] = gl.getUniformLocation(prog, n));
+gl.uniform1i(U.uText, 0);
+
+/* --------------------------- poster texture --------------------------- */
+
+const textCv = document.createElement('canvas');
+const tex = gl.createTexture();
+gl.activeTexture(gl.TEXTURE0);
+gl.bindTexture(gl.TEXTURE_2D, tex);
+
+// 折射需要一张背景纹理；这里用简单文字代替原页面的海报。
+// 替换此函数可绘制自己的文字、图案或已加载的图片。
+function drawBackground(ctx, W, H){
+  ctx.fillStyle = '#f4f2ee';
+  ctx.fillRect(0, 0, W, H);
+  ctx.fillStyle = '#151517';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  const size = Math.min(W * 0.22, H * 0.30);
+  ctx.font = size + 'px Didot, "Bodoni 72", Georgia, serif';
+  ctx.fillText('Glass', W * 0.5, H * 0.48);
+  ctx.strokeStyle = 'rgba(21,21,23,0.18)';
+  ctx.lineWidth = Math.max(1, H * 0.001);
+  [0.30, 0.68].forEach(y => {
+    ctx.beginPath();
+    ctx.moveTo(W * 0.12, H * y);
+    ctx.lineTo(W * 0.88, H * y);
+    ctx.stroke();
+  });
+}
+
+/* ------------------------------ state --------------------------------- */
+
+const dpr = Math.min(window.devicePixelRatio || 1, 2);
+let W = 0, H = 0;
+
+const clamp = (v, a, b) => Math.min(b, Math.max(a, v));
+
+function resize(){
+  W = Math.round(innerWidth*dpr);
+  H = Math.round(innerHeight*dpr);
+  canvas.width = W; canvas.height = H;
+  textCv.width = W; textCv.height = H;
+  drawBackground(textCv.getContext('2d'), W, H);
+  gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
+  gl.bindTexture(gl.TEXTURE_2D, tex);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, textCv);
+  gl.generateMipmap(gl.TEXTURE_2D);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  gl.viewport(0, 0, W, H);
+}
+addEventListener('resize', resize);
+resize();
+
+/* ------------------------- interaction state -------------------------- */
+
+let mtx = 0, mty = 0, mx = 0, my = 0;      // pointer parallax (target / smoothed)
+let dragX = 0, dragY = 0;                  // accumulated drag rotation
+let dragging = false, lx = 0, ly = 0;
+let wheelS = 1;
+
+canvas.addEventListener('pointerdown', e => {
+  dragging = true; lx = e.clientX; ly = e.clientY;
+  canvas.classList.add('dragging');
+  try { canvas.setPointerCapture(e.pointerId); } catch(err){}
+});
+addEventListener('pointermove', e => {
+  mtx = (e.clientX/innerWidth)*2 - 1;
+  mty = -((e.clientY/innerHeight)*2 - 1);
+  if(dragging){
+    dragX += (e.clientX - lx)*0.006;
+    dragY  = clamp(dragY + (e.clientY - ly)*0.005, -1.0, 1.0);
+    lx = e.clientX; ly = e.clientY;
+  }
+});
+addEventListener('pointerup',    () => { dragging = false; canvas.classList.remove('dragging'); });
+addEventListener('pointercancel',() => { dragging = false; canvas.classList.remove('dragging'); });
+addEventListener('wheel', e => {
+  e.preventDefault();
+  wheelS = clamp(wheelS*Math.exp(-e.deltaY*0.0009), 0.55, 1.7);
+}, { passive:false });
+
+setTimeout(() => { document.getElementById('hint').style.opacity = 0; }, 5000);
+
+/* ---------------------------- render loop ----------------------------- */
+
+// row-major 3x3 helpers
+const RX = b => [1,0,0, 0,Math.cos(b),Math.sin(b), 0,-Math.sin(b),Math.cos(b)];
+const RY = a => [Math.cos(a),0,Math.sin(a), 0,1,0, -Math.sin(a),0,Math.cos(a)];
+function mul3(A, B){
+  const C = new Array(9);
+  for(let i=0;i<3;i++) for(let j=0;j<3;j++)
+    C[i*3+j] = A[i*3]*B[j] + A[i*3+1]*B[3+j] + A[i*3+2]*B[6+j];
+  return C;
+}
+const colMajor = m => [m[0],m[3],m[6], m[1],m[4],m[7], m[2],m[5],m[8]];
+
+function setCube(i, c, s, rx, ry){
+  gl.uniform3f(U['uC'+i], c[0], c[1], c[2]);
+  gl.uniform1f(U['uS'+i], s);
+  gl.uniformMatrix3fv(U['uR'+i], false, colMajor(mul3(RY(ry), RX(rx))));
+}
+
+const TANY = 0.3153, CAMZ = 3.0;
+const easeOut = x => 1 - Math.pow(1 - x, 3);
+const t0 = performance.now();
+
+// ndc placement -> world position on the cube's depth plane
+function place(nx, ny, zc, s, r, drop){
+  const hh = TANY*(CAMZ - zc);
+  return [nx*hh*(W/H), ny*hh + (1 - r)*drop, zc, s*r];
+}
+
+function frame(now){
+  const t = (now - t0)/1000;
+  mx += (mtx - mx)*0.06;
+  my += (mty - my)*0.06;
+
+  const r0 = easeOut(clamp((t - 0.10)/1.10, 0, 1));
+
+  const a0 = place(0.0, 0.0, 0.55, CUBE.size*wheelS, r0, 1.1);
+
+  const rotY0 =  0.62 + t*CUBE.spin + mx*0.25 + dragX;
+  const rotX0 = -0.12 + Math.sin(t*0.13)*0.16 + my*0.18 + dragY;
+
+  gl.uniform2f(U.uRes, W, H);
+  gl.uniform1f(U.uTime, t);
+  setCube(0, [a0[0], a0[1], a0[2]], a0[3], rotX0, rotY0);
+  gl.drawArrays(gl.TRIANGLES, 0, 3);
+
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
